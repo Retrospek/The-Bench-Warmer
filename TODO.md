@@ -1,0 +1,7 @@
+- [ ] Add rim_model_path parameter to BasketballTrackerLive.**init**
+- [ ] Load rim YOLO model in **init**
+- [ ] Modify process_frame to detect rim once when hoop_bbox is None
+- [ ] Implement rim detection logic using external model
+- [ ] Add keyboard input 'h' to re-detect rim
+- [ ] Test rim detection on sample frames
+- [ ] Verify shot detection works with dynamic hoop position
