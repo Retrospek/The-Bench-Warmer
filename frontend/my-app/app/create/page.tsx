@@ -1,5 +1,6 @@
 "use client";
 
+import { useRouter } from 'next/navigation'; // For App Router
 import { useState } from "react";
 
 const generateTimeOptions = () => {
@@ -14,6 +15,8 @@ const generateTimeOptions = () => {
 };
 
 export default function CreateGame() {
+  const router = useRouter();
+
   const pointOptions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
   const timeOptions = generateTimeOptions();
   const gameOptions = ["1v1", "2v2", "3v3", "4v4", "5v5"];
@@ -32,7 +35,7 @@ export default function CreateGame() {
   const handlePlay = () => {
     alert(`Starting ${game} game to ${points} points, ${time} limit`);
     // You can route to your game page here using next/navigation:
-    // router.push(`/game?points=${points}&time=${time}&type=${game}`);
+    router.push(`/play?points=${points}&time=${time}&type=${game}`);
   };
 
   return (
