@@ -3,7 +3,30 @@
 import Heatmap from "@/components/HeatMap"
 import Link from "next/link"; 
 
+import { useSearchParams } from "next/navigation";
+import {useEffect, useState} from "react";
+
+function secondsToTime(totalSeconds: number): string {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  // Pad with leading zero if needed (e.g. "1:05" instead of "1:5")
+  const formattedSeconds = seconds.toString().padStart(2, "0");
+
+  return `${minutes}:${formattedSeconds}`;
+}
+
 export default function GameStats() {
+  const searchParams = useSearchParams(); 
+
+  const [timeElapsed, setTimeElapsed] = useState("");
+  useEffect(() => {
+    let time = searchParams.get("timeElapsed");
+    if(time) {
+      setTimeElapsed(secondsToTime(parseInt(time)));
+    }
+  }, [])
+
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-[#2e2e2e] text-white">
       <div className="bg-[#bfbfbf] text-white rounded-lg p-8 w-[600px]">
@@ -31,7 +54,7 @@ export default function GameStats() {
           <div className="flex flex-col justify-between h-full">
             <div>
               <p className="text-lg font-semibold mb-1">Time Elapsed</p>
-              <p className="text-3xl font-bold">10:00</p>
+              <p className="text-3xl font-bold">{timeElapsed}</p>
             </div>
 
             {/* Separate Play Again button below */}
