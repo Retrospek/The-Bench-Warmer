@@ -5,7 +5,7 @@ import { useState } from "react";
 
 const generateTimeOptions = () => {
   const times: string[] = [];
-  for (let totalSeconds = 60; totalSeconds <= 20 * 60; totalSeconds += 30) {
+  for (let totalSeconds = 30; totalSeconds <= 20 * 60; totalSeconds += 30) {
     const minutes = Math.floor(totalSeconds / 60);
     const seconds = totalSeconds % 60;
     const formatted = `${minutes}:${seconds.toString().padStart(2, "0")}`;

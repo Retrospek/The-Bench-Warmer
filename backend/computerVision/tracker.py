@@ -13,6 +13,7 @@ import os
 from ultralytics import YOLO
 import supervision as sv
 
+# Tracks backetball and people uses same model at same time
 class BasketballTrackerLive:
     def __init__(self, model_path='yolov8x.pt', confidence=0.3):
         """
