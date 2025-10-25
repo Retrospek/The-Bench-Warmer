@@ -4,17 +4,15 @@ from collections import defaultdict
 import torch
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-
-# ===== INSTALLATION REQUIRED =====
-# pip install opencv-python numpy torch torchvision ultralytics scikit-learn pillow supervision
+import time
 
 from ultralytics import YOLO
 import supervision as sv
 
-class BasketballTracker:
+class BasketballTrackerLive:
     def __init__(self, model_path='yolov8x.pt', confidence=0.3):
         """
-        Initialize the basketball tracker
+        Initialize the basketball tracker for live feed
         
         Args:
             model_path: Path to YOLO model (yolov8x.pt has person, sports ball classes)
@@ -24,16 +22,10 @@ class BasketballTracker:
         self.model = YOLO(model_path)
         self.confidence = confidence
         
-        # Initialize tracker
         self.tracker = sv.ByteTrack()
         
-        # Team assignment storage
-        self.team_assignments = {}  # track_id -> team_label
-        self.player_embeddings = defaultdict(list)  # track_id -> list of embeddings
-        
-        # Annotators
-        self.box_annotator = sv.BoxAnnotator(thickness=2)
-        self.label_annotator = sv.LabelAnnotator(text_thickness=2, text_scale=1)
+        self.team_assignments = {}  
+        self.player_embeddings = defaultdict(list)
         
         # Team colors (BGR format for OpenCV)
         self.team_colors = {
@@ -41,6 +33,10 @@ class BasketballTracker:
             1: (0, 0, 255),    # Red for Team 2
             -1: (128, 128, 128) # Gray for unassigned
         }
+        
+        # FPS tracking
+        self.fps = 0
+        self.frame_times = []
         
     def extract_color_histogram(self, image, bbox):
         """
@@ -93,13 +89,14 @@ class BasketballTracker:
         
         return embedding
     
-    def cluster_teams(self, embeddings_dict, min_samples=5):
+    def cluster_teams(self, embeddings_dict, min_samples=5, balanced=True):
         """
         Cluster players into teams based on their visual embeddings
         
         Args:
             embeddings_dict: Dictionary mapping track_id to list of embeddings
             min_samples: Minimum number of embeddings needed per player
+            balanced: If True, enforce equal team sizes (reject odd number of players)
         
         Returns:
             Dictionary mapping track_id to team_label (0 or 1)
@@ -108,7 +105,16 @@ class BasketballTracker:
         valid_ids = [tid for tid, embs in embeddings_dict.items() 
                      if len(embs) >= min_samples]
         
+        # Handle edge cases
         if len(valid_ids) < 2:
+            if len(valid_ids) == 1:
+                return {valid_ids[0]: 0}  # Assign single player to team 0
+            return {}
+        
+        # Check if balanced teams are possible
+        if balanced and len(valid_ids) % 2 != 0:
+            # Odd number of players - can't balance teams
+            # Return empty to wait for even number
             return {}
         
         # Average embeddings for each player
@@ -121,13 +127,52 @@ class BasketballTracker:
         avg_embeddings = np.array(avg_embeddings)
         
         # Optional: dimensionality reduction if needed
-        if avg_embeddings.shape[1] > 10:
+        n_samples = avg_embeddings.shape[0]
+        n_features = avg_embeddings.shape[1]
+        
+        if n_features > 10 and n_samples > 10:
             pca = PCA(n_components=10)
+            avg_embeddings = pca.fit_transform(avg_embeddings)
+        elif n_features > n_samples:
+            pca = PCA(n_components=min(n_samples - 1, n_features))
             avg_embeddings = pca.fit_transform(avg_embeddings)
         
         # K-means clustering (k=2 for two teams)
         kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
         team_labels = kmeans.fit_predict(avg_embeddings)
+        
+        # If balanced mode, verify equal distribution
+        if balanced:
+            team_0_count = np.sum(team_labels == 0)
+            team_1_count = np.sum(team_labels == 1)
+            
+            # If imbalanced, rebalance by reassigning furthest players
+            if team_0_count != team_1_count:
+                # Calculate distances to cluster centers
+                distances = kmeans.transform(avg_embeddings)
+                
+                # Determine which team has more players
+                if team_0_count > team_1_count:
+                    excess_team = 0
+                    deficit_team = 1
+                else:
+                    excess_team = 1
+                    deficit_team = 0
+                
+                # Find players to reassign (those closest to the other cluster)
+                excess_mask = team_labels == excess_team
+                excess_indices = np.where(excess_mask)[0]
+                
+                # Get distances from excess team players to deficit team center
+                distances_to_deficit = distances[excess_mask, deficit_team]
+                
+                # How many to reassign?
+                num_to_reassign = abs(team_0_count - team_1_count) // 2
+                
+                # Reassign closest players to balance
+                closest_indices = np.argsort(distances_to_deficit)[:num_to_reassign]
+                for idx in closest_indices:
+                    team_labels[excess_indices[idx]] = deficit_team
         
         # Create mapping
         team_assignment = {}
@@ -135,6 +180,18 @@ class BasketballTracker:
             team_assignment[tid] = int(label)
         
         return team_assignment
+    
+    def update_fps(self):
+        """Calculate and update FPS"""
+        current_time = time.time()
+        self.frame_times.append(current_time)
+        
+        # Keep only last 30 frame times
+        if len(self.frame_times) > 30:
+            self.frame_times.pop(0)
+        
+        if len(self.frame_times) > 1:
+            self.fps = len(self.frame_times) / (self.frame_times[-1] - self.frame_times[0])
     
     def process_frame(self, frame, frame_count, cluster_interval=30):
         """
@@ -148,8 +205,11 @@ class BasketballTracker:
         Returns:
             Annotated frame
         """
+        # Update FPS
+        self.update_fps()
+        
         # Run detection
-        results = self.model(frame, conf=self.confidence, classes=[0, 32])[0]
+        results = self.model(frame, conf=self.confidence, classes=[0, 32], verbose=False)[0]
         # classes=[0, 32] -> 0: person, 32: sports ball
         
         # Convert to supervision format
@@ -171,12 +231,14 @@ class BasketballTracker:
                                                       player_detections.tracker_id)):
                 embedding = self.extract_color_histogram(frame, bbox)
                 self.player_embeddings[track_id].append(embedding)
+                
+                # Limit embedding history to save memory
+                if len(self.player_embeddings[track_id]) > 50:
+                    self.player_embeddings[track_id].pop(0)
         
         # Periodically re-cluster teams
         if frame_count % cluster_interval == 0 and len(self.player_embeddings) > 0:
-            print(f"Frame {frame_count}: Clustering teams...")
             self.team_assignments = self.cluster_teams(self.player_embeddings)
-            print(f"Assigned {len(self.team_assignments)} players to teams")
         
         # Annotate frame
         annotated = frame.copy()
@@ -194,7 +256,7 @@ class BasketballTracker:
                 
                 # Draw label
                 team_name = f"Team {team + 1}" if team >= 0 else "Unassigned"
-                label = f"{team_name} (ID: {track_id})"
+                label = f"{team_name}"
                 
                 cv2.putText(annotated, label, (x1, y1 - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -207,73 +269,181 @@ class BasketballTracker:
                 cv2.putText(annotated, "BALL", (x1, y1 - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
-        # Add stats
+        # Add stats overlay
         team_counts = defaultdict(int)
         for team in self.team_assignments.values():
             team_counts[team] += 1
         
-        stats_y = 30
-        cv2.putText(annotated, f"Frame: {frame_count}", (10, stats_y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(annotated, f"Team 1: {team_counts[0]} | Team 2: {team_counts[1]}", 
-                   (10, stats_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # Create semi-transparent overlay for stats
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (10, 10), (400, 120), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, annotated, 0.4, 0, annotated)
+        
+        # Draw stats text
+        stats_y = 35
+        cv2.putText(annotated, f"FPS: {self.fps:.1f}", (20, stats_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(annotated, f"Team 1: {team_counts[0]} players", 
+                   (20, stats_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        cv2.putText(annotated, f"Team 2: {team_counts[1]} players", 
+                   (20, stats_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        # Instructions
+        cv2.putText(annotated, "Press 'q' to quit, 'r' to reset teams", 
+                   (10, annotated.shape[0] - 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return annotated
     
-    def process_video(self, video_path, output_path='output_basketball.mp4', 
-                     max_frames=None):
+    def run_webcam(self, camera_id=0, cluster_interval=30):
         """
-        Process entire video
+        Run tracker on webcam feed
         
         Args:
-            video_path: Path to input video
-            output_path: Path to save output video
-            max_frames: Maximum frames to process (None for all)
+            camera_id: Camera device ID (0 for default webcam)
+            cluster_interval: How often to re-cluster teams (in frames)
         """
-        cap = cv2.VideoCapture(video_path)
+        print(f"Opening webcam (ID: {camera_id})...")
+        cap = cv2.VideoCapture(camera_id)
         
-        # Get video properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if not cap.isOpened():
+            print("Error: Could not open webcam")
+            return
         
-        # Video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        # Set resolution (optional)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        
+        print("Webcam opened successfully!")
+        print("Press 'q' to quit")
+        print("Press 'r' to reset team assignments")
         
         frame_count = 0
         
-        print(f"Processing video: {video_path}")
-        print(f"FPS: {fps}, Resolution: {width}x{height}")
-        
-        while cap.isOpened():
+        while True:
             ret, frame = cap.read()
             if not ret:
-                break
-            
-            if max_frames and frame_count >= max_frames:
+                print("Failed to grab frame")
                 break
             
             # Process frame
-            annotated = self.process_frame(frame, frame_count)
+            annotated = self.process_frame(frame, frame_count, cluster_interval)
             
-            # Write frame
-            out.write(annotated)
+            # Display
+            cv2.imshow('Basketball Tracker - LIVE', annotated)
             
-            # Display (optional)
-            cv2.imshow('Basketball Tracker', annotated)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("Quitting...")
                 break
+            elif key == ord('r'):
+                print("Resetting team assignments...")
+                self.team_assignments = {}
+                self.player_embeddings = defaultdict(list)
             
             frame_count += 1
-            if frame_count % 30 == 0:
-                print(f"Processed {frame_count} frames...")
         
         cap.release()
-        out.release()
         cv2.destroyAllWindows()
+        print("Webcam closed")
+    
+    def run_stream(self, stream_url, cluster_interval=30, save_output=False, 
+                   output_path='output_stream.mp4'):
+        """
+        Run tracker on video stream (RTSP, HTTP, etc.)
         
-        print(f"\nProcessing complete!")
-        print(f"Output saved to: {output_path}")
-        print(f"Total frames processed: {frame_count}")
+        Args:
+            stream_url: URL of the video stream
+            cluster_interval: How often to re-cluster teams (in frames)
+            save_output: Whether to save output video
+            output_path: Path to save output if save_output=True
+        """
+        print(f"Connecting to stream: {stream_url}")
+        cap = cv2.VideoCapture(stream_url)
+        
+        if not cap.isOpened():
+            print("Error: Could not open stream")
+            return
+        
+        print("Stream connected successfully!")
+        print("Press 'q' to quit")
+        print("Press 'r' to reset team assignments")
+        
+        # Setup video writer if saving
+        out = None
+        if save_output:
+            fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            print(f"Saving output to: {output_path}")
+        
+        frame_count = 0
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame from stream")
+                break
+            
+            # Process frame
+            annotated = self.process_frame(frame, frame_count, cluster_interval)
+            
+            # Save frame if recording
+            if save_output and out is not None:
+                out.write(annotated)
+            
+            # Display
+            cv2.imshow('Basketball Tracker - STREAM', annotated)
+            
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("Quitting...")
+                break
+            elif key == ord('r'):
+                print("Resetting team assignments...")
+                self.team_assignments = {}
+                self.player_embeddings = defaultdict(list)
+            
+            frame_count += 1
+        
+        cap.release()
+        if out is not None:
+            out.release()
+        cv2.destroyAllWindows()
+        print("Stream closed")
 
+
+def main():
+    """
+    Main function - choose your video source
+    """
+    # Initialize tracker
+    tracker = BasketballTrackerLive(
+        model_path='backend\computerVision\yolov8n.pt',  # nano for low latency
+        confidence=0.35
+    )
+    
+    # ===== CHOOSE ONE OF THE OPTIONS BELOW =====
+    
+    # Option 1: Use webcam
+    tracker.run_webcam(camera_id=0, cluster_interval=30)
+    
+    # Option 2: Use RTSP stream (IP camera, etc.)
+    # stream_url = "rtsp://username:password@ip_address:port/stream"
+    # tracker.run_stream(stream_url, cluster_interval=30, save_output=False)
+    
+    # Option 3: Use HTTP stream
+    # stream_url = "http://your-stream-url.com/stream.mjpg"
+    # tracker.run_stream(stream_url, cluster_interval=30, save_output=True)
+    
+    # Option 4: Use YouTube live stream (requires youtube-dl/yt-dlp)
+    # stream_url = "https://www.youtube.com/watch?v=VIDEO_ID"
+    # tracker.run_stream(stream_url, cluster_interval=30, save_output=False)
+
+
+if __name__ == "__main__":
+    main()
