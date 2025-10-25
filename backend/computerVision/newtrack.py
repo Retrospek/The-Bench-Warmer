@@ -50,7 +50,11 @@ class BasketballTrackerSageMaker:
         # Hardcoded hoop / net in normalized coordinates (left, top, right, bottom)
         # These were picked based on your JumpStart outputs (top-right-ish). Adjust if needed.
         # We'll convert to pixels per frame when drawing.
-        self.hoop_bbox_norm = (0.5, 0.02, 0.65, 0.32)
+        self.hoop_bbox_norm = (0.52, 0.2, 0.57, 0.3)
+
+        self.last_possession_team = -1   # -1 means no last possession
+        self.shot_buffer_frames = 40     # Number of frames to ignore after a shot
+        self.shot_buffer_counter = 0     # Counts frames since last shot
 
         print("SageMaker tracker initialized!")
 
@@ -66,7 +70,7 @@ class BasketballTrackerSageMaker:
             )
             result = json.loads(response['Body'].read())
             # debug: prints first 1000 chars
-            print("SageMaker raw output:", json.dumps(result, indent=2)[:1000])
+            #print("SageMaker raw output:", json.dumps(result, indent=2)[:1000])
             return self.parse_sagemaker_response(result, frame.shape)
         except Exception as e:
             print(f"SageMaker inference error: {e}")
@@ -117,10 +121,8 @@ class BasketballTrackerSageMaker:
             area = width * height
             ratio = width / (height + 1e-6)
 
-            # smaller and roughly square
-            if area < 0.0005 or area > 0.02:
-                return False
-            if 0.75 <= ratio <= 1.25:
+            # Accept anything reasonably small and not too stretched
+            if area > 0 and 0.5 <= ratio <= 2.0:
                 return True
             return False
 
@@ -316,7 +318,7 @@ class BasketballTrackerSageMaker:
         self.team_assignments = assignments
 
     def process_frame(self, frame, frame_count, cluster_interval=30):
-        # FPS update
+        # --- FPS update ---
         now = time.time()
         self.frame_times.append(now)
         if len(self.frame_times) > 30:
@@ -324,14 +326,14 @@ class BasketballTrackerSageMaker:
         if len(self.frame_times) > 1:
             self.fps = len(self.frame_times) / (self.frame_times[-1] - self.frame_times[0])
 
-        # inference
+        # --- Inference ---
         detections = self.query_sagemaker_endpoint(frame)
 
-        # track players
+        # --- Track players ---
         player_bboxes = [d['bbox'] for d in detections['players']]
         self.player_tracker = self.simple_track(player_bboxes, self.player_tracker, max_distance=60)
 
-        # update embeddings per track (rolling window)
+        # --- Update embeddings per track ---
         for bbox_tuple, track_id in self.player_tracker.items():
             bbox = list(bbox_tuple)
             emb = self.extract_color_histogram(frame, bbox)
@@ -339,41 +341,68 @@ class BasketballTrackerSageMaker:
             if len(self.player_embeddings[track_id]) > 60:
                 self.player_embeddings[track_id].pop(0)
 
-        # run clustering every cluster_interval frames (or when new players appear)
+        # --- Run clustering ---
         if frame_count % cluster_interval == 0:
             self.cluster_teams()
 
-        # Annotate
+        # --- Annotate frame ---
         annotated = frame.copy()
-
-        # draw hardcoded hoop in pixels
         h, w = frame.shape[:2]
+
+        # Draw hardcoded hoop
         hl, ht, hr, hb = self.hoop_bbox_norm
-        hx1 = int(max(0, hl) * w)
-        hy1 = int(max(0, ht) * h)
-        hx2 = int(min(1.0, hr) * w)
-        hy2 = int(min(1.0, hb) * h)
+        hx1, hy1 = int(hl * w), int(ht * h)
+        hx2, hy2 = int(hr * w), int(hb * h)
         cv2.rectangle(annotated, (hx1, hy1), (hx2, hy2), (0, 255, 255), 2)
         cv2.putText(annotated, "NET", (hx1, max(0, hy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
 
-        # Draw players with their team colors (force assignment)
+        # Draw players
         for bbox_tuple, track_id in self.player_tracker.items():
             bbox = list(map(int, bbox_tuple))
-            team = self.team_assignments.get(track_id, 0)  # default 0 if not yet clustered
+            team = self.team_assignments.get(track_id, 0)
             color = self.team_colors[team]
             x1, y1, x2, y2 = bbox
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
             cv2.putText(annotated, f"T{team+1} ID:{track_id}", (x1, max(0, y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Draw balls (orange)
+        # --- Draw balls & detect scoring ---
+        score_made = False
+        possession_team = self.last_possession_team
+
         for ball in detections['balls']:
             bx1, by1, bx2, by2 = map(int, ball['bbox'])
             cv2.rectangle(annotated, (bx1, by1), (bx2, by2), self.ball_color, 2)
             cv2.putText(annotated, "BALL", (bx1, max(0, by1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.ball_color, 2)
 
-        # stats overlay
+            # ball center
+            ball_cx = (bx1 + bx2) / 2
+            ball_cy = (by1 + by2) / 2
+
+            # Determine if ball overlaps hoop (score) & respect buffer
+            if self.shot_buffer_counter == 0 and hx1 <= ball_cx <= hx2 and hy1 <= ball_cy <= hy2:
+                score_made = True
+                self.shot_buffer_counter = self.shot_buffer_frames
+
+            # Determine last possession: closest player to ball
+            min_dist = float('inf')
+            for bbox_tuple, track_id in self.player_tracker.items():
+                x1, y1, x2, y2 = bbox_tuple
+                px, py = (x1 + x2) / 2, (y1 + y2) / 2
+                d = np.hypot(ball_cx - px, ball_cy - py)
+                if d < min_dist:
+                    min_dist = d
+                    possession_team = self.team_assignments.get(track_id, -1)
+
+        # Update buffer counter
+        if self.shot_buffer_counter > 0:
+            self.shot_buffer_counter -= 1
+
+        # Update last possession
+        self.last_possession_team = possession_team
+
+        # --- Stats overlay ---
         team_counts = defaultdict(int)
         for t in self.team_assignments.values():
             team_counts[t] += 1
@@ -385,8 +414,11 @@ class BasketballTrackerSageMaker:
         cv2.putText(annotated, f"FPS: {self.fps:.1f}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
         cv2.putText(annotated, f"Team1(Red): {team_counts.get(0,0)}", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.team_colors[0], 2)
         cv2.putText(annotated, f"Team2(Blue): {team_counts.get(1,0)}", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.team_colors[1], 2)
+        cv2.putText(annotated, f"Last Possession: T{possession_team+1 if possession_team>=0 else 'N/A'}",
+                    (20, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
-        return annotated
+        return annotated, score_made, possession_team
+
 
     def process_frames_directory(self, frames_dir, output_dir='backend/computerVision/annotated_frames', fps=30):
         frames_path = Path(frames_dir)
@@ -404,7 +436,9 @@ class BasketballTrackerSageMaker:
                 print(f"WARNING: Could not read {frame_file}, skipping...")
                 continue
 
-            annotated = self.process_frame(frame, frame_count)
+            annotated, score_made, possession = self.process_frame(frame, frame_count)
+            print(f"Shot Made: {score_made}")
+            print(f"Possession: {possession}")
             out_path = os.path.join(output_dir, frame_file.name)  # keep original filename
             cv2.imwrite(out_path, annotated)
 
