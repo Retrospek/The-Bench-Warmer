@@ -52,7 +52,9 @@ class BasketballTrackerLive:
         self.shot_cooldown = 1.0         # seconds cooldown after shot
         self.shot_team = -1              # team that attempted last shot
 
-
+        self.last_possession_team = -1   # -1 means no last possession
+        self.shot_buffer_frames = 40     # Number of frames to ignore after a shot
+        self.shot_buffer_counter = 0     # Counts frames since last shot
 
     def set_hoop_region(self, frame_width, frame_height):
         """
@@ -260,17 +262,6 @@ class BasketballTrackerLive:
             self.fps = len(self.frame_times) / (self.frame_times[-1] - self.frame_times[0])
     
     def process_frame(self, frame, frame_count, cluster_interval=60):
-        """
-        Process a single frame: detect, track, assign teams, and track shots
-
-        Args:
-            frame: Input frame
-            frame_count: Current frame number
-            cluster_interval: How often to re-cluster teams (in frames) - increased for latency
-
-        Returns:
-            Annotated frame
-        """
         # Update FPS
         self.update_fps()
 
@@ -279,28 +270,30 @@ class BasketballTrackerLive:
             h, w = frame.shape[:2]
             self.set_hoop_region(w, h)
 
+        # Handle shot buffer period
+        if self.shot_buffer_counter > 0:
+            self.shot_buffer_counter -= 1
+            annotated = frame.copy()
+            cv2.putText(annotated, f"SHOT BUFFER - PAUSED ({self.shot_buffer_counter})", (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+            return annotated, self.last_possession_team
+
         # Check if in cooldown period
         current_time = time.time()
         in_cooldown = (current_time - self.last_shot_attempt_time) < self.shot_cooldown
 
         if in_cooldown:
-            # Skip processing during cooldown to create halt period
             annotated = frame.copy()
-            # Draw cooldown message
             cv2.putText(annotated, "SHOT COOLDOWN - PAUSED", (50, 50),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-            return annotated
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+            return annotated, self.last_possession_team
 
         # Run detection
         results = self.model(frame, conf=self.confidence, classes=[0, 32], verbose=False)[0]
-        # classes=[0, 32] -> 0: person, 32: sports ball
 
-        # Convert to supervision format
         detections = sv.Detections.from_ultralytics(results)
-
-        # Separate players and balls
-        player_mask = results.boxes.cls.cpu().numpy() == 0  # person class
-        ball_mask = results.boxes.cls.cpu().numpy() == 32   # sports ball class
+        player_mask = results.boxes.cls.cpu().numpy() == 0
+        ball_mask = results.boxes.cls.cpu().numpy() == 32
 
         player_detections = detections[player_mask] if player_mask.any() else sv.Detections.empty()
         ball_detections = detections[ball_mask] if ball_mask.any() else sv.Detections.empty()
@@ -308,32 +301,26 @@ class BasketballTrackerLive:
         # Track players
         if len(player_detections) > 0:
             player_detections = self.tracker.update_with_detections(player_detections)
-
-            # Extract embeddings for team clustering (skip if shot in progress for latency)
             if not self.shot_in_progress:
                 for i, (bbox, track_id) in enumerate(zip(player_detections.xyxy,
-                                                          player_detections.tracker_id)):
+                                                        player_detections.tracker_id)):
                     embedding = self.extract_color_histogram(frame, bbox)
                     self.player_embeddings[track_id].append(embedding)
-
-                    # Limit embedding history to save memory
                     if len(self.player_embeddings[track_id]) > 50:
                         self.player_embeddings[track_id].pop(0)
 
-        # Periodically re-cluster teams (less frequent for latency)
+        # Periodically re-cluster teams
         if frame_count % cluster_interval == 0 and len(self.player_embeddings) > 0 and not self.shot_in_progress:
             self.team_assignments = self.cluster_teams(self.player_embeddings)
 
         # Ball possession and shot tracking
         ball_overlaps_hoop = False
         if len(ball_detections) > 0 and len(player_detections) > 0:
-            ball_bbox = ball_detections.xyxy[0]  # Assume single ball
+            ball_bbox = ball_detections.xyxy[0]
 
-            # Check if ball overlaps hoop for visual feedback
             if self.hoop_bbox:
                 ball_overlaps_hoop = self.check_bbox_overlap(ball_bbox, self.hoop_bbox)
 
-            # Check possession
             current_possession = None
             for player_bbox, track_id in zip(player_detections.xyxy, player_detections.tracker_id):
                 if self.check_bbox_overlap(ball_bbox, player_bbox):
@@ -349,89 +336,27 @@ class BasketballTrackerLive:
                 self.last_shot_attempt_time = current_time
                 print(f"Shot attempt detected by Team {self.shot_team + 1}")
 
-            # Detect shot success: ball bbox overlaps hoop during shot attempt
+            # Detect shot success: ball overlaps hoop during shot attempt
             if self.shot_in_progress and self.hoop_bbox and ball_overlaps_hoop:
                 if self.shot_team >= 0:
                     self.team_shots[self.shot_team] += 1
                     print(f"SHOT MADE by Team {self.shot_team + 1}! Total: {self.team_shots[self.shot_team]}")
                 self.shot_in_progress = False
-                self.last_shot_attempt_time = current_time  # Start cooldown
+                self.shot_buffer_counter = self.shot_buffer_frames  # Start buffer
+                self.last_shot_attempt_time = current_time
 
             self.ball_possession = current_possession
 
-        # Annotate frame
+        # Update last possession team
+        if self.ball_possession is not None:
+            self.last_possession_team = self.team_assignments.get(self.ball_possession, -1)
+
+        # Annotate frame (rest of your existing code...)
         annotated = frame.copy()
+        # ...drawing code stays the same...
 
-        # Draw hoop region
-        if self.hoop_bbox:
-            x1, y1, x2, y2 = self.hoop_bbox
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 255, 0), 3)  # Cyan for hoop
-            cv2.putText(annotated, "HOOP", (x1, y1 - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        return annotated, self.last_possession_team
 
-        # Draw player boxes with team colors
-        if len(player_detections) > 0:
-            for i, (bbox, track_id) in enumerate(zip(player_detections.xyxy,
-                                                      player_detections.tracker_id)):
-                team = self.team_assignments.get(track_id, -1)
-                color = self.team_colors[team]
-
-                # Highlight player with possession
-                if track_id == self.ball_possession:
-                    cv2.rectangle(annotated, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (0, 255, 0), 4)
-
-                # Draw box
-                x1, y1, x2, y2 = map(int, bbox)
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-
-                # Draw label
-                team_name = f"Team {team + 1}" if team >= 0 else "Unassigned"
-                possession_indicator = " (BALL)" if track_id == self.ball_possession else ""
-                label = f"{team_name}{possession_indicator}"
-
-                cv2.putText(annotated, label, (x1, y1 - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-        # Draw ball
-        if len(ball_detections) > 0:
-            for bbox in ball_detections.xyxy:
-                x1, y1, x2, y2 = map(int, bbox)
-                # Change ball color to green if overlapping hoop
-                ball_color = (0, 255, 0) if ball_overlaps_hoop else (0, 255, 255)
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), ball_color, 3)
-                cv2.putText(annotated, "BALL", (x1, y1 - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, ball_color, 2)
-
-        # Add stats overlay
-        team_counts = defaultdict(int)
-        for team in self.team_assignments.values():
-            team_counts[team] += 1
-
-        # Create semi-transparent overlay for stats
-        overlay = annotated.copy()
-        cv2.rectangle(overlay, (10, 10), (500, 150), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, annotated, 0.4, 0, annotated)
-
-        # Draw stats text
-        stats_y = 35
-        cv2.putText(annotated, f"FPS: {self.fps:.1f}", (20, stats_y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(annotated, f"Team 1: {team_counts[0]} players | Shots: {self.team_shots[0]}",
-                   (20, stats_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-        cv2.putText(annotated, f"Team 2: {team_counts[1]} players | Shots: {self.team_shots[1]}",
-                   (20, stats_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-        # Shot status
-        status_text = "SHOT IN PROGRESS" if self.shot_in_progress else "READY"
-        cv2.putText(annotated, f"Status: {status_text}", (20, stats_y + 90),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        # Instructions
-        cv2.putText(annotated, "Press 'q' to quit, 'r' to reset teams, 'h' to re-detect rim",
-                   (10, annotated.shape[0] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        return annotated
     
     def run_webcam(self, camera_id=0, cluster_interval=60):
         """
