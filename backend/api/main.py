@@ -62,7 +62,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     annotatedImage, shotMade, posession = BasketballTrackerSageMaker.process_frame(frame)
                     message = {
-                        "shotMade": shotMade,
+                        "shotMade": 1 if shotMade else 0,
                         "possession": posession,
                     }
                     await websocket.send(JSON.stringify(message))

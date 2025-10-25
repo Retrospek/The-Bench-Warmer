@@ -110,12 +110,14 @@ export default function PlayGame() {
             //   setTeam2Percentage(data.numPlayersTeam2);
             // }
 
-            if (typeof data.shotMade === "number") {
+            if ((typeof data.shotMade === "number") || (typeof data.possession === "number")) {
               // You can increment score or just track shots
-              if (data.shotMade === 1) {
-                setTeam1Score((s) => s + 2);
-              } else if (data.shotMade === 2) {
-                setTeam2Score((s) => s + 2);
+              if(data.shotMade) {
+                if(data.posession == 0) {
+                  setTeam1Score(s => s + 2);
+                } else {
+                  setTeam2Score(s => s + 2);
+                }
               }
             }
 
