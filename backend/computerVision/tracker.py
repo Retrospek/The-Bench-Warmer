@@ -1,4 +1,7 @@
 import cv2
+if not hasattr(cv2, 'imshow'):
+    cv2.imshow = lambda *args, **kwargs: None
+    
 import numpy as np
 from collections import defaultdict
 import torch
