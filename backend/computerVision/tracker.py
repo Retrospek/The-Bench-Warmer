@@ -1,7 +1,7 @@
 import cv2
 if not hasattr(cv2, 'imshow'):
     cv2.imshow = lambda *args, **kwargs: None
-    
+
 import numpy as np
 from collections import defaultdict
 import torch
@@ -567,7 +567,7 @@ def main():
     # Initialize tracker
     tracker = BasketballTrackerLive(
         model_path='backend/computerVision/yolov8n.pt',  # nano for low latency
-        confidence=0.35,
+        confidence=0.1,
         #rim_model_path='backend/computerVision/rim_model.pt'  # Path to rim detection model (optional)
     )
     
